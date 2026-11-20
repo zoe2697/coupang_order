@@ -89,73 +89,146 @@ selected_sales=sales[sales['예정일']==chosen].copy()
 selected_raw=raw[raw['입고일'].between(start,end_ts,inclusive='both')].copy()
 st.caption(f'발주 예정일 {start:%Y-%m-%d} | 입고 인정 기간 {start:%Y-%m-%d} ~ {end_ts:%Y-%m-%d} | RAW {len(selected_raw):,}행 (중복 제거 없음)')
 
-# Aggregate independently. Unmapped records are excluded from matched totals, shown as exceptions.
-valid=selected_raw[selected_raw['매핑상태']=='정상']
-sales_group=selected_sales.groupby(['센터명','ME코드'],as_index=False).agg(발주수량=('발주수량','sum'),발주금액=('발주금액','sum'),품목명=('제품명','first'))
-raw_group=valid.groupby(['센터명','ME코드'],as_index=False).agg(입고수량=('입고수량','sum'),입고금액=('입고금액','sum'),입고건수=('SKU번호','size'))
-merged=sales_group.merge(raw_group,on=['센터명','ME코드'],how='outer',indicator=True)
-merged['품목명']=merged['품목명'].fillna('발주목록에 없는 입고 품목')
-for c in ['발주수량','발주금액','입고수량','입고금액','입고건수']:merged[c]=merged[c].fillna(0)
+# Match within each center by SKU-linked product identity.  Multiple ME codes
+# for one SKU are not an error when the sales rows refer to the same item.
+# Exact normalized sales product names also join differently coded sales rows.
+import re
+
+def normalized_name(value):
+    return re.sub(r"\s+", "", clean(value)).casefold()
+
+# Each center has independent item groups; never combine across centers.
+sales_rows = selected_sales.reset_index(drop=True).copy()
+sales_rows['상품명키'] = sales_rows['제품명'].map(normalized_name)
+sales_rows['연결SKU'] = sales_rows['ME코드'].map(lambda me: set(products.loc[products['ME코드']==me, 'SKU ID']))
+parent = list(range(len(sales_rows)))
+def find(i):
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+def union(i,j):
+    ri,rj=find(i),find(j)
+    if ri!=rj: parent[rj]=ri
+
+for center_name, indexes in sales_rows.groupby('센터명').groups.items():
+    indexes=list(indexes)
+    for n,i in enumerate(indexes):
+        for j in indexes[n+1:]:
+            si,sj=sales_rows.loc[i],sales_rows.loc[j]
+            same_name=bool(si['상품명키']) and si['상품명키']==sj['상품명키']
+            same_sku=bool(si['연결SKU'] & sj['연결SKU'])
+            if same_name or same_sku:
+                union(i,j)
+
+sales_rows['그룹']= [find(i) for i in range(len(sales_rows))]
+items=[]
+for gid, group in sales_rows.groupby('그룹',sort=False):
+    items.append({'그룹':gid,'센터명':group['센터명'].iloc[0],
+        'ME코드':', '.join(sorted(set(group['ME코드']))),
+        '품목명':' / '.join(dict.fromkeys(group['제품명'].map(clean))),
+        '발주수량':group['발주수량'].sum(), '발주금액':group['발주금액'].sum(),
+        '입고수량':0.,'입고금액':0.,'입고건수':0,
+        'SKU집합':set().union(*group['연결SKU'].tolist())})
+
+# Raw SKU -> a unique ordered item group in the same center. All raw rows
+# count, including identical SKU/quantity/timestamp rows.
+lookup={}
+for item in items:
+    for sku in item['SKU집합']:
+        lookup.setdefault((item['센터명'],sku),[]).append(item)
+
+exceptions_rows=[]
+extra={}
+for _,r in selected_raw.iterrows():
+    if len(r['센터후보'])!=1:
+        exceptions_rows.append({**r.to_dict(),'매핑상태':'센터 미등록' if not r['센터후보'] else '센터 중복 매핑'})
+        continue
+    center_name=r['센터후보'][0]
+    candidates=lookup.get((center_name,r['SKU번호']),[])
+    if len(candidates)==1:
+        item=candidates[0]
+        item['입고수량']+=r['입고수량']
+        item['입고금액']+=r['입고금액']
+        item['입고건수']+=1
+    elif len(candidates)>1:
+        exceptions_rows.append({**r.to_dict(),'매핑상태':'동일 SKU에 여러 발주 품목 연결'})
+    elif len(r['ME후보'])>1:
+        # A multi-code SKU is valid only if the relevant center has a unique
+        # matching order group; otherwise it remains an unmatched raw receipt.
+        k=(center_name,r['SKU번호'])
+        if k not in extra: extra[k]={'센터명':center_name,'ME코드':', '.join(r['ME후보']),
+             '품목명':clean(r['SKU명']),'발주수량':0,'발주금액':0,'입고수량':0.,'입고금액':0.,'입고건수':0}
+        extra[k]['입고수량']+=r['입고수량'];extra[k]['입고금액']+=r['입고금액'];extra[k]['입고건수']+=1
+    else:
+        k=(center_name,r['SKU번호'])
+        if k not in extra:extra[k]={'센터명':center_name,'ME코드':', '.join(r['ME후보']) or f"SKU {r['SKU번호']}",
+             '품목명':clean(r['SKU명']),'발주수량':0,'발주금액':0,'입고수량':0.,'입고금액':0.,'입고건수':0}
+        extra[k]['입고수량']+=r['입고수량'];extra[k]['입고금액']+=r['입고금액'];extra[k]['입고건수']+=1
+
+exceptions=pd.DataFrame(exceptions_rows)
+records=[]
+for item in items:
+    records.append({k:v for k,v in item.items() if k not in ('그룹','SKU집합')})
+records+=list(extra.values())
+merged=pd.DataFrame(records,columns=['센터명','ME코드','품목명','발주수량','입고수량','발주금액','입고금액','입고건수'])
 merged['수량차이']=merged['입고수량']-merged['발주수량']
 merged['금액차이']=merged['입고금액']-merged['발주금액']
 def status(r):
-    if r['_merge']=='right_only':return '발주 외 입고'
+    if r['발주수량']==0:return '발주 외 입고'
     if r['입고수량']==0:return '미입고'
     if r['입고수량']<r['발주수량']:return '부분 입고'
     if r['입고수량']>r['발주수량']:return '초과 입고'
     if abs(r['금액차이'])>0.5:return '금액 확인 필요'
     return '매입 완료'
 merged['매입상태']=merged.apply(status,axis=1)
-# A matching ambiguity can affect a seemingly completed row: warn that results are provisional.
-exceptions=selected_raw[selected_raw['매핑상태']!='정상'].copy()
 cols=['센터명','ME코드','품목명','발주수량','입고수량','수량차이','발주금액','입고금액','금액차이','입고건수','매입상태']
-merged=merged[cols].sort_values(['매입상태','센터명','ME코드']).reset_index(drop=True)
+merged=merged[cols].sort_values(['센터명','품목명']).reset_index(drop=True)
 
-if not exceptions.empty:
-    st.warning(f'매핑 확인이 필요한 RAW {len(exceptions):,}행이 있습니다. 해당 입고분은 매칭 집계에서 제외되어 결과가 잠정적입니다.')
 raw_total=selected_raw['입고금액'].sum()
-matched_total=valid['입고금액'].sum()
+order_total=selected_sales['발주금액'].sum()
+if not exceptions.empty:
+    st.warning(f'센터 또는 상품 매칭 확인이 필요한 RAW {len(exceptions):,}행이 있습니다. 해당 행은 품목별 집계에서 제외되므로 결과를 확인해 주세요.')
 col=st.columns(4)
-col[0].metric('발주 총금액',f"{selected_sales['발주금액'].sum():,.0f}원")
+col[0].metric('발주 총금액',f'{order_total:,.0f}원')
 col[1].metric('실제 입고 총금액',f'{raw_total:,.0f}원')
-col[2].metric('총금액 차이',f"{raw_total-selected_sales['발주금액'].sum():+,.0f}원")
-col[3].metric('매입 완료 / 비교 항목',f"{(merged['매입상태']=='매입 완료').sum():,} / {len(merged):,}")
-st.caption(f'매핑 완료 입고금액 {matched_total:,.0f}원 | 매핑 확인 필요 입고금액 {raw_total-matched_total:,.0f}원. 총액 일치는 개별 매입 완료를 의미하지 않습니다.')
+col[2].metric('총금액 차이',f'{raw_total-order_total:+,.0f}원')
+col[3].metric('매입 완료 / 비교 품목',f"{(merged['매입상태']=='매입 완료').sum():,} / {len(merged):,}")
+st.caption('같은 센터에서 동일 SKU에 연결된 ME코드 또는 동일한 발주 품목명은 하나의 제품으로 비교합니다. RAW는 중복 제거 없이 전 행 합산합니다.')
 
-t1,t2,t3,t4=st.tabs(['① 전체 매입 현황','② 센터별 현황','③ 품목별 상세','④ 매칭 확인 필요'])
+t1,t2,t3=st.tabs(['① 전체 매입 현황','② 센터별 품목 상세','③ 매칭 확인 필요'])
 with t1:
-    st.subheader('매입 상태별 건수')
-    st.dataframe(merged['매입상태'].value_counts().rename_axis('상태').reset_index(name='품목·센터 조합 수'),hide_index=True,use_container_width=True)
-    st.subheader('확인 필요 항목')
-    st.dataframe(merged[merged['매입상태']!='매입 완료'][cols],hide_index=True,use_container_width=True)
+    st.subheader('확인 필요 품목')
+    pending=merged[merged['매입상태']!='매입 완료']
+    if pending.empty:st.success('품목별 매입 확인 결과 모두 완료되었습니다.')
+    else:st.dataframe(pending,hide_index=True,use_container_width=True)
 with t2:
-    st.subheader('센터별 발주·입고 비교')
-    center=merged.groupby('센터명',as_index=False).agg(발주수량=('발주수량','sum'),입고수량=('입고수량','sum'),발주금액=('발주금액','sum'),입고금액=('입고금액','sum'),확인필요=('매입상태',lambda s:(s!='매입 완료').sum()))
-    center['수량차이']=center['입고수량']-center['발주수량']
-    center['금액차이']=center['입고금액']-center['발주금액']
-    st.dataframe(center,hide_index=True,use_container_width=True)
-with t3:
-    st.subheader('센터·ME코드별 매입 대조')
-    choices=['전체']+sorted(merged['매입상태'].unique().tolist())
-    selected=st.selectbox('매입 상태',choices)
-    shown=merged if selected=='전체' else merged[merged['매입상태']==selected]
+    st.subheader('센터별 품목 매입 대조')
+    options=['전체 센터']+sorted(merged['센터명'].dropna().unique().tolist())
+    selected_center=st.selectbox('센터 선택',options)
+    shown=merged if selected_center=='전체 센터' else merged[merged['센터명']==selected_center]
+    a,b,c=st.columns(3)
+    a.metric('선택 센터 발주금액',f"{shown['발주금액'].sum():,.0f}원")
+    b.metric('선택 센터 입고금액',f"{shown['입고금액'].sum():,.0f}원")
+    c.metric('선택 센터 금액 차이',f"{shown['금액차이'].sum():+,.0f}원")
     st.dataframe(shown,hide_index=True,use_container_width=True)
-with t4:
-    st.subheader('센터/SKU 매핑 검증')
-    st.caption('상품매핑관리의 SKU ID가 여러 ME코드에 연결된 경우 임의로 선택하지 않습니다. 센터 참조에 동일 영문코드가 서로 다른 센터명으로 등록되어도 확인 대상으로 표시합니다.')
-    if exceptions.empty:st.success('선택 기간 RAW의 센터·SKU 매핑 오류가 없습니다.')
+with t3:
+    st.subheader('센터/SKU 매칭 검증')
+    if exceptions.empty:st.success('선택 기간의 매칭 오류가 없습니다.')
     else:
         view=exceptions[['입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].copy()
         view['센터 후보']=exceptions['센터후보'].map(lambda a:', '.join(a))
         view['ME 후보']=exceptions['ME후보'].map(lambda a:', '.join(a))
         st.dataframe(view,hide_index=True,use_container_width=True)
-    duplicated_centers={k:v for k,v in center_map.items() if len(v)>1}
-    if duplicated_centers:st.warning('센터 참조 내 중복 매핑: '+str(duplicated_centers))
+    st.caption('동일 SKU에 여러 ME코드가 있어도 해당 센터의 발주 품목을 하나로 특정할 수 있으면 정상 매칭합니다.')
 
+center=merged.groupby('센터명',as_index=False).agg(발주수량=('발주수량','sum'),입고수량=('입고수량','sum'),발주금액=('발주금액','sum'),입고금액=('입고금액','sum'))
+center['수량차이']=center['입고수량']-center['발주수량']
+center['금액차이']=center['입고금액']-center['발주금액']
 buf=io.BytesIO()
 with pd.ExcelWriter(buf,engine='openpyxl') as writer:
     merged.to_excel(writer,sheet_name='품목별 매입 확인',index=False)
     center.to_excel(writer,sheet_name='센터별 현황',index=False)
     if not exceptions.empty:
-        exceptions[['입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].to_excel(writer,sheet_name='매핑 확인 필요',index=False)
+        exceptions[['입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].to_excel(writer,sheet_name='매칭 확인 필요',index=False)
 st.download_button('매입 확인 결과 엑셀 다운로드',data=buf.getvalue(),file_name=f'쿠팡_매입확인_{start:%Y%m%d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
