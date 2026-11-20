@@ -206,12 +206,29 @@ with t2:
     st.subheader('센터별 품목 매입 대조')
     options=['전체 센터']+sorted(merged['센터명'].dropna().unique().tolist())
     selected_center=st.selectbox('센터 선택',options)
-    shown=merged if selected_center=='전체 센터' else merged[merged['센터명']==selected_center]
+    center_data=merged if selected_center=='전체 센터' else merged[merged['센터명']==selected_center]
+    # 센터별 금액 지표는 상태 필터와 무관하게 해당 센터 전체 기준으로 표시합니다.
     a,b,c=st.columns(3)
-    a.metric('선택 센터 발주금액',f"{shown['발주금액'].sum():,.0f}원")
-    b.metric('선택 센터 입고금액',f"{shown['입고금액'].sum():,.0f}원")
-    c.metric('선택 센터 금액 차이',f"{shown['금액차이'].sum():+,.0f}원")
-    st.dataframe(shown,hide_index=True,use_container_width=True)
+    a.metric('선택 센터 발주금액',f"{center_data['발주금액'].sum():,.0f}원")
+    b.metric('선택 센터 입고금액',f"{center_data['입고금액'].sum():,.0f}원")
+    c.metric('선택 센터 금액 차이',f"{center_data['금액차이'].sum():+,.0f}원")
+
+    # 엑셀 필터처럼 여러 매입상태를 선택할 수 있습니다. 기본값은 전체 상태입니다.
+    status_order=['매입 완료','미입고','부분 입고','초과 입고','금액 확인 필요','발주 외 입고']
+    available_statuses=[x for x in status_order if x in center_data['매입상태'].unique()]
+    selected_statuses=st.multiselect(
+        '매입상태 필터 (복수 선택 가능)',
+        options=available_statuses,
+        default=available_statuses,
+        key='center_purchase_status_filter',
+        placeholder='표시할 매입상태를 선택하세요',
+    )
+    shown=center_data[center_data['매입상태'].isin(selected_statuses)].copy()
+    st.caption(f'표시 품목: {len(shown):,}건 / 선택 센터 전체: {len(center_data):,}건 · 금액 지표는 필터 적용 전 센터 전체 기준입니다.')
+    if shown.empty:
+        st.info('선택한 조건에 해당하는 품목이 없습니다.')
+    else:
+        st.dataframe(shown,hide_index=True,use_container_width=True)
 with t3:
     st.subheader('센터/SKU 매칭 검증')
     if exceptions.empty:st.success('선택 기간의 매칭 오류가 없습니다.')
