@@ -68,26 +68,48 @@ raw['센터명']=raw['센터후보'].map(lambda a:a[0] if len(a)==1 else '')
 raw['ME코드']=raw['ME후보'].map(lambda a:a[0] if len(a)==1 else '')
 raw['매핑상태']=raw.apply(lambda r:'센터 미등록' if not r['센터후보'] else '센터 중복 매핑' if len(r['센터후보'])>1 else 'SKU 미등록' if not r['ME후보'] else 'SKU 중복 매핑' if len(r['ME후보'])>1 else '정상',axis=1)
 
-st.sidebar.header('입고 인정 기간')
-unique_dates=sorted(sales['예정일'].dropna().unique())
+st.sidebar.header('매입확인 범위')
+unique_dates=sorted(pd.Timestamp(x) for x in sales['예정일'].dropna().unique())
 if not unique_dates:
     st.error('Sales Report의 Date 열에서 예정 입고일을 찾지 못했습니다.')
     st.stop()
-chosen=st.sidebar.selectbox('확인할 예정 입고일',unique_dates,format_func=lambda x:pd.Timestamp(x).strftime('%Y-%m-%d'))
-next_dates=[x for x in unique_dates if x>chosen]
-if next_dates:
-    default_end=pd.Timestamp(next_dates[0])-pd.Timedelta(days=1)
-    st.sidebar.caption('다음 예정 입고일 전날까지 자동 적용')
+mode=st.sidebar.radio('확인 방식', ['기간별 일괄 확인', '입고예정일별 확인'])
+if mode=='입고예정일별 확인':
+    chosen=st.sidebar.selectbox('확인할 예정 입고일',unique_dates,format_func=lambda x:x.strftime('%Y-%m-%d'))
+    target_dates=[chosen]
 else:
-    default_end=raw['입고일'].max()
-    if pd.isna(default_end) or default_end<pd.Timestamp(chosen):default_end=pd.Timestamp(chosen)
-    st.sidebar.caption('다음 발주일이 파일에 없어 종료일을 직접 확인해 주세요.')
-end=st.sidebar.date_input('입고 인정 종료일',value=default_end.date(),min_value=pd.Timestamp(chosen).date())
-start=pd.Timestamp(chosen)
-end_ts=pd.Timestamp(end)
-selected_sales=sales[sales['예정일']==chosen].copy()
-selected_raw=raw[raw['입고일'].between(start,end_ts,inclusive='both')].copy()
-st.caption(f'발주 예정일 {start:%Y-%m-%d} | 입고 인정 기간 {start:%Y-%m-%d} ~ {end_ts:%Y-%m-%d} | RAW {len(selected_raw):,}행 (중복 제거 없음)')
+    first=st.sidebar.date_input('발주 예정일 시작',value=unique_dates[0].date())
+    last=st.sidebar.date_input('발주 예정일 종료 (포함)',value=min(pd.Timestamp.today().normalize()-pd.Timedelta(days=1),unique_dates[-1]).date())
+    if first>last:
+        st.error('시작일은 종료일보다 늦을 수 없습니다.')
+        st.stop()
+    target_dates=[d for d in unique_dates if pd.Timestamp(first)<=d<=pd.Timestamp(last)]
+    if not target_dates:
+        st.warning('선택 기간에 발주 예정일이 없습니다.')
+        st.stop()
+
+# Periods are determined from ALL sales dates, including dates outside the
+# selected range, so the final selected order cannot consume later receipts.
+periods=[]
+for d in target_dates:
+    next_dates=[x for x in unique_dates if x>d]
+    if next_dates:
+        period_end=next_dates[0]-pd.Timedelta(days=1)
+    else:
+        period_end=raw['입고일'].max()
+        if pd.isna(period_end) or period_end<d: period_end=d
+        # Do not assign receipts beyond the selected cutoff when no later
+        # order date exists in the uploaded sales report.
+        if mode=='기간별 일괄 확인':
+            period_end=min(period_end,pd.Timestamp(last))
+    periods.append((d,period_end))
+if mode=='입고예정일별 확인':
+    proposed_end=periods[0][1]
+    manual_end=st.sidebar.date_input('입고 인정 종료일',value=proposed_end.date(),min_value=target_dates[0].date())
+    periods=[(target_dates[0],pd.Timestamp(manual_end))]
+st.caption(f'{mode} · 발주 예정일 {target_dates[0]:%Y-%m-%d} ~ {target_dates[-1]:%Y-%m-%d} · {len(periods)}개 입고예정일 (RAW 중복 제거 없음)')
+if mode=='기간별 일괄 확인' and target_dates[-1]==unique_dates[-1]:
+    st.info('마지막 발주 예정일 이후의 다음 발주일이 파일에 없으므로, 해당 건의 입고 인정 종료일은 선택한 종료일로 제한합니다. 다음 발주일을 포함한 Sales Report를 업로드하면 기간이 더 정확해집니다.')
 
 # Match within each center by SKU-linked product identity.  Multiple ME codes
 # for one SKU are not an error when the sales rows refer to the same item.
@@ -97,96 +119,117 @@ import re
 def normalized_name(value):
     return re.sub(r"\s+", "", clean(value)).casefold()
 
-# Each center has independent item groups; never combine across centers.
-sales_rows = selected_sales.reset_index(drop=True).copy()
-sales_rows['상품명키'] = sales_rows['제품명'].map(normalized_name)
-sales_rows['연결SKU'] = sales_rows['ME코드'].map(lambda me: set(products.loc[products['ME코드']==me, 'SKU ID']))
-parent = list(range(len(sales_rows)))
-def find(i):
-    while parent[i] != i:
-        parent[i] = parent[parent[i]]
-        i = parent[i]
-    return i
-def union(i,j):
-    ri,rj=find(i),find(j)
-    if ri!=rj: parent[rj]=ri
+def reconcile_period(selected_sales,selected_raw,order_date,period_end):
+    # Each center has independent item groups; never combine across centers.
+    sales_rows = selected_sales.reset_index(drop=True).copy()
+    sales_rows['상품명키'] = sales_rows['제품명'].map(normalized_name)
+    sales_rows['연결SKU'] = sales_rows['ME코드'].map(lambda me: set(products.loc[products['ME코드']==me, 'SKU ID']))
+    parent = list(range(len(sales_rows)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(i,j):
+        ri,rj=find(i),find(j)
+        if ri!=rj: parent[rj]=ri
 
-for center_name, indexes in sales_rows.groupby('센터명').groups.items():
-    indexes=list(indexes)
-    for n,i in enumerate(indexes):
-        for j in indexes[n+1:]:
-            si,sj=sales_rows.loc[i],sales_rows.loc[j]
-            same_name=bool(si['상품명키']) and si['상품명키']==sj['상품명키']
-            same_sku=bool(si['연결SKU'] & sj['연결SKU'])
-            if same_name or same_sku:
-                union(i,j)
+    for center_name, indexes in sales_rows.groupby('센터명').groups.items():
+        indexes=list(indexes)
+        for n,i in enumerate(indexes):
+            for j in indexes[n+1:]:
+                si,sj=sales_rows.loc[i],sales_rows.loc[j]
+                same_name=bool(si['상품명키']) and si['상품명키']==sj['상품명키']
+                same_sku=bool(si['연결SKU'] & sj['연결SKU'])
+                if same_name or same_sku:
+                    union(i,j)
 
-sales_rows['그룹']= [find(i) for i in range(len(sales_rows))]
-items=[]
-for gid, group in sales_rows.groupby('그룹',sort=False):
-    items.append({'그룹':gid,'센터명':group['센터명'].iloc[0],
-        'ME코드':', '.join(sorted(set(group['ME코드']))),
-        '품목명':' / '.join(dict.fromkeys(group['제품명'].map(clean))),
-        '발주수량':group['발주수량'].sum(), '발주금액':group['발주금액'].sum(),
-        '입고수량':0.,'입고금액':0.,'입고건수':0,
-        'SKU집합':set().union(*group['연결SKU'].tolist())})
+    sales_rows['그룹']= [find(i) for i in range(len(sales_rows))]
+    items=[]
+    for gid, group in sales_rows.groupby('그룹',sort=False):
+        items.append({'그룹':gid,'센터명':group['센터명'].iloc[0],
+            'ME코드':', '.join(sorted(set(group['ME코드']))),
+            '품목명':' / '.join(dict.fromkeys(group['제품명'].map(clean))),
+            '발주수량':group['발주수량'].sum(), '발주금액':group['발주금액'].sum(),
+            '입고수량':0.,'입고금액':0.,'입고건수':0,
+            'SKU집합':set().union(*group['연결SKU'].tolist())})
 
-# Raw SKU -> a unique ordered item group in the same center. All raw rows
-# count, including identical SKU/quantity/timestamp rows.
-lookup={}
-for item in items:
-    for sku in item['SKU집합']:
-        lookup.setdefault((item['센터명'],sku),[]).append(item)
+    # Raw SKU -> a unique ordered item group in the same center. All raw rows
+    # count, including identical SKU/quantity/timestamp rows.
+    lookup={}
+    for item in items:
+        for sku in item['SKU집합']:
+            lookup.setdefault((item['센터명'],sku),[]).append(item)
 
-exceptions_rows=[]
-extra={}
-for _,r in selected_raw.iterrows():
-    if len(r['센터후보'])!=1:
-        exceptions_rows.append({**r.to_dict(),'매핑상태':'센터 미등록' if not r['센터후보'] else '센터 중복 매핑'})
-        continue
-    center_name=r['센터후보'][0]
-    candidates=lookup.get((center_name,r['SKU번호']),[])
-    if len(candidates)==1:
-        item=candidates[0]
-        item['입고수량']+=r['입고수량']
-        item['입고금액']+=r['입고금액']
-        item['입고건수']+=1
-    elif len(candidates)>1:
-        exceptions_rows.append({**r.to_dict(),'매핑상태':'동일 SKU에 여러 발주 품목 연결'})
-    elif len(r['ME후보'])>1:
-        # A multi-code SKU is valid only if the relevant center has a unique
-        # matching order group; otherwise it remains an unmatched raw receipt.
-        k=(center_name,r['SKU번호'])
-        if k not in extra: extra[k]={'센터명':center_name,'ME코드':', '.join(r['ME후보']),
-             '품목명':clean(r['SKU명']),'발주수량':0,'발주금액':0,'입고수량':0.,'입고금액':0.,'입고건수':0}
-        extra[k]['입고수량']+=r['입고수량'];extra[k]['입고금액']+=r['입고금액'];extra[k]['입고건수']+=1
-    else:
-        k=(center_name,r['SKU번호'])
-        if k not in extra:extra[k]={'센터명':center_name,'ME코드':', '.join(r['ME후보']) or f"SKU {r['SKU번호']}",
-             '품목명':clean(r['SKU명']),'발주수량':0,'발주금액':0,'입고수량':0.,'입고금액':0.,'입고건수':0}
-        extra[k]['입고수량']+=r['입고수량'];extra[k]['입고금액']+=r['입고금액'];extra[k]['입고건수']+=1
+    exceptions_rows=[]
+    extra={}
+    for _,r in selected_raw.iterrows():
+        if len(r['센터후보'])!=1:
+            exceptions_rows.append({**r.to_dict(),'매핑상태':'센터 미등록' if not r['센터후보'] else '센터 중복 매핑'})
+            continue
+        center_name=r['센터후보'][0]
+        candidates=lookup.get((center_name,r['SKU번호']),[])
+        if len(candidates)==1:
+            item=candidates[0]
+            item['입고수량']+=r['입고수량']
+            item['입고금액']+=r['입고금액']
+            item['입고건수']+=1
+        elif len(candidates)>1:
+            exceptions_rows.append({**r.to_dict(),'매핑상태':'동일 SKU에 여러 발주 품목 연결'})
+        elif len(r['ME후보'])>1:
+            # A multi-code SKU is valid only if the relevant center has a unique
+            # matching order group; otherwise it remains an unmatched raw receipt.
+            k=(center_name,r['SKU번호'])
+            if k not in extra: extra[k]={'센터명':center_name,'ME코드':', '.join(r['ME후보']),
+                 '품목명':clean(r['SKU명']),'발주수량':0,'발주금액':0,'입고수량':0.,'입고금액':0.,'입고건수':0}
+            extra[k]['입고수량']+=r['입고수량'];extra[k]['입고금액']+=r['입고금액'];extra[k]['입고건수']+=1
+        else:
+            k=(center_name,r['SKU번호'])
+            if k not in extra:extra[k]={'센터명':center_name,'ME코드':', '.join(r['ME후보']) or f"SKU {r['SKU번호']}",
+                 '품목명':clean(r['SKU명']),'발주수량':0,'발주금액':0,'입고수량':0.,'입고금액':0.,'입고건수':0}
+            extra[k]['입고수량']+=r['입고수량'];extra[k]['입고금액']+=r['입고금액'];extra[k]['입고건수']+=1
 
-exceptions=pd.DataFrame(exceptions_rows)
-records=[]
-for item in items:
-    records.append({k:v for k,v in item.items() if k not in ('그룹','SKU집합')})
-records+=list(extra.values())
-merged=pd.DataFrame(records,columns=['센터명','ME코드','품목명','발주수량','입고수량','발주금액','입고금액','입고건수'])
-merged['수량차이']=merged['입고수량']-merged['발주수량']
-merged['금액차이']=merged['입고금액']-merged['발주금액']
-def status(r):
-    if r['발주수량']==0:return '발주 외 입고'
-    if r['입고수량']==0:return '미입고'
-    if r['입고수량']<r['발주수량']:return '부분 입고'
-    if r['입고수량']>r['발주수량']:return '초과 입고'
-    if abs(r['금액차이'])>0.5:return '금액 확인 필요'
-    return '매입 완료'
-merged['매입상태']=merged.apply(status,axis=1)
-cols=['센터명','ME코드','품목명','발주수량','입고수량','수량차이','발주금액','입고금액','금액차이','입고건수','매입상태']
-merged=merged[cols].sort_values(['센터명','품목명']).reset_index(drop=True)
+    exceptions=pd.DataFrame(exceptions_rows)
+    records=[]
+    for item in items:
+        records.append({k:v for k,v in item.items() if k not in ('그룹','SKU집합')})
+    records+=list(extra.values())
+    merged=pd.DataFrame(records,columns=['센터명','ME코드','품목명','발주수량','입고수량','발주금액','입고금액','입고건수'])
+    merged['수량차이']=merged['입고수량']-merged['발주수량']
+    merged['금액차이']=merged['입고금액']-merged['발주금액']
+    def status(r):
+        if r['발주수량']==0:return '발주 외 입고'
+        if r['입고수량']==0:return '미입고'
+        if r['입고수량']<r['발주수량']:return '부분 입고'
+        if r['입고수량']>r['발주수량']:return '초과 입고'
+        if abs(r['금액차이'])>0.5:return '금액 확인 필요'
+        return '매입 완료'
+    merged['매입상태']=merged.apply(status,axis=1)
+    cols=['센터명','ME코드','품목명','발주수량','입고수량','수량차이','발주금액','입고금액','금액차이','입고건수','매입상태']
+    merged=merged[cols].sort_values(['센터명','품목명']).reset_index(drop=True)
 
-raw_total=selected_raw['입고금액'].sum()
-order_total=selected_sales['발주금액'].sum()
+    merged.insert(0,'입고예정일',pd.Timestamp(order_date))
+    merged.insert(1,'입고인정종료일',pd.Timestamp(period_end))
+    if not exceptions.empty:
+        exceptions.insert(0,'입고예정일',pd.Timestamp(order_date))
+    return merged,exceptions
+
+results=[]
+issues=[]
+raw_total=0.
+order_total=0.
+for order_date,period_end in periods:
+    selected_sales=sales[sales['예정일']==order_date].copy()
+    selected_raw=raw[raw['입고일'].between(order_date,period_end,inclusive='both')].copy()
+    result,issue=reconcile_period(selected_sales,selected_raw,order_date,period_end)
+    results.append(result)
+    if not issue.empty: issues.append(issue)
+    raw_total+=selected_raw['입고금액'].sum()
+    order_total+=selected_sales['발주금액'].sum()
+merged=pd.concat(results,ignore_index=True)
+exceptions=pd.concat(issues,ignore_index=True) if issues else pd.DataFrame()
+merged=merged.sort_values(['입고예정일','센터명','품목명']).reset_index(drop=True)
+
 if not exceptions.empty:
     st.warning(f'센터 또는 상품 매칭 확인이 필요한 RAW {len(exceptions):,}행이 있습니다. 해당 행은 품목별 집계에서 제외되므로 결과를 확인해 주세요.')
 col=st.columns(4)
@@ -213,6 +256,8 @@ with t2:
     b.metric('선택 센터 입고금액',f"{center_data['입고금액'].sum():,.0f}원")
     c.metric('선택 센터 금액 차이',f"{center_data['금액차이'].sum():+,.0f}원")
 
+    date_options=sorted(center_data['입고예정일'].dt.date.unique().tolist())
+    selected_dates=st.multiselect('입고예정일 필터 (복수 선택 가능)',options=date_options,default=date_options,format_func=lambda x:x.strftime('%Y-%m-%d'))
     # 엑셀 필터처럼 여러 매입상태를 선택할 수 있습니다. 기본값은 전체 상태입니다.
     status_order=['매입 완료','미입고','부분 입고','초과 입고','금액 확인 필요','발주 외 입고']
     available_statuses=[x for x in status_order if x in center_data['매입상태'].unique()]
@@ -223,7 +268,7 @@ with t2:
         key='center_purchase_status_filter',
         placeholder='표시할 매입상태를 선택하세요',
     )
-    shown=center_data[center_data['매입상태'].isin(selected_statuses)].copy()
+    shown=center_data[center_data['매입상태'].isin(selected_statuses) & center_data['입고예정일'].dt.date.isin(selected_dates)].copy()
     st.caption(f'표시 품목: {len(shown):,}건 / 선택 센터 전체: {len(center_data):,}건 · 금액 지표는 필터 적용 전 센터 전체 기준입니다.')
     if shown.empty:
         st.info('선택한 조건에 해당하는 품목이 없습니다.')
@@ -233,7 +278,7 @@ with t3:
     st.subheader('센터/SKU 매칭 검증')
     if exceptions.empty:st.success('선택 기간의 매칭 오류가 없습니다.')
     else:
-        view=exceptions[['입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].copy()
+        view=exceptions[['입고예정일','입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].copy()
         view['센터 후보']=exceptions['센터후보'].map(lambda a:', '.join(a))
         view['ME 후보']=exceptions['ME후보'].map(lambda a:', '.join(a))
         st.dataframe(view,hide_index=True,use_container_width=True)
@@ -247,5 +292,5 @@ with pd.ExcelWriter(buf,engine='openpyxl') as writer:
     merged.to_excel(writer,sheet_name='품목별 매입 확인',index=False)
     center.to_excel(writer,sheet_name='센터별 현황',index=False)
     if not exceptions.empty:
-        exceptions[['입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].to_excel(writer,sheet_name='매칭 확인 필요',index=False)
-st.download_button('매입 확인 결과 엑셀 다운로드',data=buf.getvalue(),file_name=f'쿠팡_매입확인_{start:%Y%m%d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        exceptions[['입고예정일','입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매핑상태']].to_excel(writer,sheet_name='매칭 확인 필요',index=False)
+st.download_button('매입 확인 결과 엑셀 다운로드',data=buf.getvalue(),file_name=f'쿠팡_매입확인_{target_dates[0]:%Y%m%d}_{target_dates[-1]:%Y%m%d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
