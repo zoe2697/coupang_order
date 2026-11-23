@@ -348,9 +348,11 @@ with t2:
             return '선택 발주 범위 외 · 확인 필요'
         if r['매칭상태'] not in ('발주 연결','품목명 연결'):
             return '발주 외 입고 / 매칭 확인 필요'
-        matching=center_data[
-            (scoped_orders['센터명']==r['센터명']) &
-            (scoped_orders['입고예정일']==r['추정 발주예정일'])
+        # Use the same DataFrame for the mask and selection; scoped_orders
+        # may have a different index after the date filter.
+        matching=center_data.loc[
+            (center_data['센터명']==r['센터명']) &
+            (center_data['입고예정일']==r['추정 발주예정일'])
         ]
         mes=set(products.loc[products['SKU ID']==r['SKU번호'],'ME코드'])
         name=normalized_name(r.get('SKU명',''))
