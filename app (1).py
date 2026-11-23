@@ -221,17 +221,28 @@ with t2:
     if view_mode=='특이사항만':
         filtered=filtered[filtered['품목매입상태']!='매입 완료'].copy()
     st.caption(f'선택 날짜 RAW 전체 금액 {raw_view.loc[raw_view["입고일"].dt.date.isin(selected_raw_dates),"입고금액"].sum():,.0f}원 · 표시 RAW 금액 {filtered["입고금액"].sum():,.0f}원')
-    # 같은 센터, 동일한 원본 입고/반출시각, 동일 SKU의 행을 합산합니다.
-    # 서로 다른 시각은 별도 행이며, 원본 중복행도 모두 합산됩니다.
+    # 화면 표시 전용 합산: 같은 센터·입고일시·SKU명·ME코드별로 수량/금액 합계.
+    # SKU번호와 상태가 다르더라도 지정한 네 기준이 같으면 하나로 표시합니다.
+    # 원본 RAW와 매입 대조 계산은 변경하지 않습니다.
     if not filtered.empty:
         filtered['입고일시']=pd.to_datetime(filtered['입고/반출시각'],errors='coerce')
-        group_cols=['입고일시','센터명','센터코드','SKU번호','SKU명','ME코드','매칭상태','품목매입상태']
-        grouped=filtered.groupby(group_cols,dropna=False,as_index=False).agg(입고수량=('입고수량','sum'),입고금액=('입고금액','sum'),원본행수=('_raw_id','size'))
-        grouped=grouped.sort_values(['입고일시','센터명','SKU번호'])
+        group_cols=['입고일시','센터명','SKU명','ME코드']
+        def unique_join(values):
+            return ', '.join(dict.fromkeys(x for x in values.map(clean) if x))
+        grouped=filtered.groupby(group_cols,dropna=False,as_index=False).agg(
+            센터코드=('센터코드',unique_join),
+            SKU번호=('SKU번호',unique_join),
+            매칭상태=('매칭상태',unique_join),
+            품목매입상태=('품목매입상태',unique_join),
+            입고수량=('입고수량','sum'),
+            입고금액=('입고금액','sum'),
+            원본행수=('_raw_id','size'))
+        grouped=grouped[['입고일시','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭상태','품목매입상태']]
+        grouped=grouped.sort_values(['입고일시','센터명','SKU명','ME코드'])
     else:
-        grouped=pd.DataFrame(columns=['입고일시','센터명','센터코드','SKU번호','SKU명','ME코드','매칭상태','품목매입상태','입고수량','입고금액','원본행수'])
+        grouped=pd.DataFrame(columns=['입고일시','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭상태','품목매입상태'])
     st.dataframe(grouped,hide_index=True,use_container_width=True)
-    st.caption('RAW 특이사항은 기간 전체 품목 매입상태 기준입니다. 미입고 품목은 실제 RAW 행이 없으므로 위 발주 대조표에서 확인하세요. 동일 시각·센터·SKU는 합산하되 원본 행은 삭제하지 않습니다.')
+    st.caption('RAW 특이사항은 기간 전체 품목 매입상태 기준입니다. 미입고 품목은 실제 RAW 행이 없으므로 위 발주 대조표에서 확인하세요. 동일 센터·입고일시·SKU명·ME코드는 수량 및 금액을 합산해 표시합니다. 원본 RAW 행은 삭제하지 않습니다.')
 with t3:
     st.subheader('발주 미연결 / 센터·SKU 매핑 확인')
     issues=raw_view[raw_view['매칭상태']!='발주 연결'].copy()
