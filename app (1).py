@@ -89,17 +89,20 @@ st.sidebar.header('기간별 일괄 매입확인')
 order_dates=sales['예정일'].dropna()
 receipt_dates=raw['입고일'].dropna()
 if order_dates.empty or receipt_dates.empty:
-    st.error('발주 예정일 또는 RAW 실제 입고일이 없습니다. 원본 날짜 열을 확인해 주세요.')
+    st.error('입고예정일 또는 RAW 실제 입고일이 없습니다. 원본 날짜 열을 확인해 주세요.')
     st.stop()
-order_start=st.sidebar.date_input('발주 예정일 시작', value=order_dates.min().date(), key='os')
-order_end=st.sidebar.date_input('발주 예정일 종료 (포함)', value=order_dates.max().date(), key='oe')
-receipt_start=st.sidebar.date_input('RAW 실제 입고일 시작', value=min(order_start, receipt_dates.min().date()), key='rs')
-receipt_end=st.sidebar.date_input('RAW 실제 입고일 종료 (포함)', value=receipt_dates.max().date(), key='re')
-if order_start>order_end or receipt_start>receipt_end:
-    st.error('시작일이 종료일보다 늦을 수 없습니다.')
+order_start=st.sidebar.date_input('입고예정일 시작', value=order_dates.min().date(), key='os')
+order_end=st.sidebar.date_input('입고예정일 종료 (포함)', value=order_dates.max().date(), key='oe')
+receipt_start=order_start
+receipt_end=receipt_dates.max().date()
+st.sidebar.caption(f'RAW 실제 입고기간 (자동): {receipt_start} ~ {receipt_end}')
+if order_start>order_end:
+    st.error('입고예정일 시작일이 종료일보다 늦을 수 없습니다.')
     st.stop()
 selected_sales=dates_between(sales,'예정일',order_start,order_end)
 selected_raw=dates_between(raw,'입고일',receipt_start,receipt_end)
+if receipt_start>receipt_end:
+    st.warning('RAW 데이터의 마지막 실제 입고일이 선택한 입고예정일 시작일보다 빠릅니다. RAW 조회 결과가 비어 있습니다.')
 
 # 발주일과 실제 입고일을 강제로 연결하지 않습니다. 센터+SKU/ME 및 정확한 품목명으로 기간 전체를 대조합니다.
 selected_sales['상품명키']=selected_sales.get('제품명',pd.Series('',index=selected_sales.index)).map(norm)
@@ -126,7 +129,7 @@ items=[]
 for gid,g in selected_sales.groupby('그룹',sort=False):
     items.append(dict(센터명=g['센터명'].iloc[0],ME코드=', '.join(sorted(set(g['ME코드']))),
         품목명=' / '.join(dict.fromkeys(g.get('제품명',pd.Series('',index=g.index)).map(clean))),
-        발주예정일=', '.join(sorted(set(g['예정일'].dt.strftime('%Y-%m-%d')))),
+        입고예정일=', '.join(sorted(set(g['예정일'].dt.strftime('%Y-%m-%d')))),
         발주수량=g['발주수량'].sum(),발주금액=g['발주금액'].sum(),
         입고수량=0.,입고금액=0.,SKU집합=set().union(*g['연결SKU'].tolist()),그룹=gid))
 lookup={}
@@ -168,7 +171,7 @@ for it in items:
     else:status='매입 완료'
     rec['매입상태']=status
     records.append(rec)
-columns=['센터명','발주예정일','ME코드','품목명','발주수량','입고수량','수량차이','발주금액','입고금액','금액차이','매입상태','그룹']
+columns=['센터명','입고예정일','ME코드','품목명','발주수량','입고수량','수량차이','발주금액','입고금액','금액차이','매입상태','그룹']
 merged=pd.DataFrame(records,columns=columns)
 if not receipt.empty:
     status_map={r['그룹']:r['매입상태'] for r in records}
@@ -176,7 +179,7 @@ if not receipt.empty:
 else:
     receipt=pd.DataFrame(columns=list(selected_raw.columns)+['연결그룹','매칭상태','품목매입상태'])
 
-st.caption(f'발주 {order_start} ~ {order_end} / 실제 입고 {receipt_start} ~ {receipt_end} · 발주일과 입고일이 달라도 기간 전체로 대조')
+st.caption(f'입고예정일 {order_start} ~ {order_end} / RAW 실제 입고일 {receipt_start} ~ {receipt_end} (자동) · 입고예정일과 실제 입고일이 달라도 기간 전체로 대조')
 centers_available=sorted(set(selected_sales['센터명'].dropna()) | set(selected_raw['센터명'].dropna()))
 center=st.selectbox('센터 선택',['전체 센터']+centers_available)
 orders_view=merged if center=='전체 센터' else merged[merged['센터명']==center]
@@ -203,13 +206,14 @@ with t2:
     st.metric('발주 총금액',f'{order_sum:,.0f}원')
     date_source=selected_sales if center=='전체 센터' else selected_sales[selected_sales['센터명']==center]
     date_options=sorted(date_source['예정일'].dt.date.dropna().unique())
-    selected_order_dates=st.multiselect('발주 입고예정일 필터',date_options,default=date_options)
+    selected_order_dates=st.multiselect('입고예정일 필터',date_options,default=date_options)
     # 발주 날짜별 원본을 별도로 표시하되 기간 전체 매입상태를 유지합니다.
     order_lines=selected_sales[selected_sales['예정일'].dt.date.isin(selected_order_dates)].copy()
     if center!='전체 센터':order_lines=order_lines[order_lines['센터명']==center]
     st.dataframe(order_lines[['예정일','센터명','ME코드','제품명','발주수량','발주금액']].rename(columns={'예정일':'입고예정일','제품명':'품목명'}),hide_index=True,use_container_width=True)
     st.caption(f'표시 발주금액 {order_lines["발주금액"].sum():,.0f}원 / 선택 센터 기간 전체 {order_sum:,.0f}원')
     st.subheader('② RAW 실제 입고 상세내역')
+    st.metric('기간 RAW 전체 입고금액',f'{raw_sum:,.0f}원')
     date_options_raw=sorted(raw_view['입고일'].dt.date.dropna().unique())
     selected_raw_dates=st.multiselect('RAW 실제 입고일 필터',date_options_raw,default=date_options_raw)
     filtered=raw_view[raw_view['입고일'].dt.date.isin(selected_raw_dates)].copy()
