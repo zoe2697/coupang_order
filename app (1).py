@@ -299,37 +299,71 @@ with t2:
     center_data=merged if selected_center=='전체 센터' else merged[merged['센터명']==selected_center]
     center_receipts=receipt_details if selected_center=='전체 센터' else receipt_details[receipt_details['센터명']==selected_center]
 
-    date_options=sorted(center_data['입고예정일'].dt.date.unique().tolist())
-    selected_dates=st.multiselect('발주 입고예정일 필터 (복수 선택 가능)',options=date_options,default=date_options,format_func=lambda x:x.strftime('%Y-%m-%d'))
+    # 발주 예정일과 실제 RAW 입고일은 서로 다른 날짜이므로 독립 필터로 제공합니다.
+    date_options=sorted(center_data['입고예정일'].dt.date.dropna().unique().tolist())
+    selected_dates=st.multiselect('발주 입고예정일 필터 (복수 선택)',date_options,default=date_options,format_func=lambda x:x.strftime('%Y-%m-%d'))
+    receipt_date_options=sorted(center_receipts['입고일'].dt.date.dropna().unique().tolist()) if not center_receipts.empty else []
+    selected_receipt_dates=st.multiselect('RAW 실제 입고일 필터 (복수 선택)',receipt_date_options,default=receipt_date_options,format_func=lambda x:x.strftime('%Y-%m-%d'))
     status_order=['매입 완료','미입고','부분 입고','초과 입고','금액 확인 필요','발주 외 입고']
     available_statuses=[x for x in status_order if x in center_data['매입상태'].unique()]
-    selected_statuses=st.multiselect('매입상태 필터 (복수 선택 가능)',options=available_statuses,default=available_statuses,key='center_purchase_status_filter')
+    selected_statuses=st.multiselect('발주 매입상태 필터 (복수 선택)',available_statuses,default=available_statuses,key='center_purchase_status_filter')
 
-    # Both tables use the same selected center and estimated order-date scope.
-    scoped_orders=center_data[center_data['입고예정일'].dt.date.isin(selected_dates)]
+    scoped_orders=center_data[center_data['입고예정일'].dt.date.isin(selected_dates)].copy()
     shown=scoped_orders[scoped_orders['매입상태'].isin(selected_statuses)].copy()
-    scoped_receipts=center_receipts[center_receipts['추정 발주예정일'].dt.date.isin(selected_dates)].copy()
-    a,b,c=st.columns(3)
-    a.metric('발주 총금액',f"{scoped_orders['발주금액'].sum():,.0f}원")
-    b.metric('RAW 입고 총금액',f"{scoped_receipts['입고금액'].sum():,.0f}원")
-    c.metric('금액 차이 (입고-발주)',f"{scoped_receipts['입고금액'].sum()-scoped_orders['발주금액'].sum():+,.0f}원")
-    st.caption('상단 금액은 센터·날짜 필터 기준이며, 매입상태 필터와 무관합니다. RAW 입고금액은 매칭 실패 행도 포함합니다.')
-
+    # RAW는 날짜 귀속(추정 발주예정일)과 실제 입고일 모두 적용합니다.
+    scoped_receipts=center_receipts[
+        center_receipts['추정 발주예정일'].dt.date.isin(selected_dates) &
+        center_receipts['입고일'].dt.date.isin(selected_receipt_dates)
+    ].copy()
+    # 원본 RAW 총액과 예외 표시 총액은 서로 다릅니다. RAW 총액에는 정상 연결 건도 포함합니다.
     st.markdown('#### ① Sales Report 발주목록')
-    st.caption('입고예정일은 Sales Report의 Date입니다. 같은 센터·날짜 내 동일 품목은 기존 규칙에 따라 합산합니다.')
+    o1,o2,o3=st.columns(3)
+    o1.metric('발주 총금액 (날짜 범위 전체)',f"{scoped_orders['발주금액'].sum():,.0f}원")
+    o2.metric('표시 품목 발주금액',f"{shown['발주금액'].sum():,.0f}원")
+    o3.metric('표시 품목 금액차이',f"{shown['금액차이'].sum():+,.0f}원")
+    st.caption('발주 총금액은 선택 센터·입고예정일 기준이며, 표시 품목 금액은 매입상태 필터도 반영합니다.')
     order_cols=['입고예정일','센터명','ME코드','품목명','발주수량','발주금액','입고수량','입고금액','수량차이','금액차이','매입상태']
     st.dataframe(shown[order_cols],hide_index=True,use_container_width=True)
     st.caption(f'표시 발주 품목 {len(shown):,}건 / 날짜 필터 대상 {len(scoped_orders):,}건')
 
-    st.markdown('#### ② RAW 입고 상세내역')
-    st.caption('입고일은 RAW의 실제 입고/반출시각에서 추출합니다. 추정 발주예정일은 날짜 구간에 따른 추정값으로, 발주번호를 검증한 확정값은 아닙니다.')
-    receipt_cols=['입고일','추정 발주예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','매칭상태']
-    st.dataframe(scoped_receipts[receipt_cols].sort_values(['입고일','센터명','SKU번호']),hide_index=True,use_container_width=True)
-    st.caption(f'RAW 입고 행 {len(scoped_receipts):,}건 · 동일 시각·SKU·수량이어도 원본 행을 삭제하지 않습니다.')
+    st.markdown('#### ② RAW 입고 상세내역 — 특이사항만')
+    # 정상 매입 완료에 연결된 행은 숨기되, 부분입고·금액오류·초과입고에
+    # 연결된 행은 원인 추적을 위해 남깁니다. RAW에는 '미입고' 행이 존재하지
+    # 않으므로 미입고 품목은 위 발주목록에서 확인합니다.
+    def receipt_exception_status(r):
+        if r['매칭상태'] not in ('발주 연결','품목명 연결'):
+            return '발주 외 입고 / 매칭 확인 필요'
+        matching=scoped_orders[
+            (scoped_orders['센터명']==r['센터명']) &
+            (scoped_orders['입고예정일']==r['추정 발주예정일'])
+        ]
+        mes=set(products.loc[products['SKU ID']==r['SKU번호'],'ME코드'])
+        name=normalized_name(r.get('SKU명',''))
+        candidates=[]
+        for _,o in matching.iterrows():
+            order_mes=set(x.strip() for x in o['ME코드'].split(','))
+            order_names=[normalized_name(x) for x in o['품목명'].split(' / ')]
+            if mes & order_mes or (name and name in order_names):
+                candidates.append(o)
+        if len(candidates)!=1:
+            return '발주 연결 검증 필요'
+        return candidates[0]['매입상태']
+
     if not scoped_receipts.empty:
-        suspicious=scoped_receipts[~scoped_receipts['매칭상태'].isin(['발주 연결','품목명 연결'])]
-        if not suspicious.empty:
-            st.warning(f'이 범위의 입고내역 중 발주 연결 확인이 필요한 RAW {len(suspicious):,}행이 있습니다. 아래 RAW 표의 매칭상태를 확인해 주세요.')
+        scoped_receipts['특이사항']=scoped_receipts.apply(receipt_exception_status,axis=1)
+        unusual=scoped_receipts[scoped_receipts['특이사항']!='매입 완료'].copy()
+    else:
+        unusual=scoped_receipts.copy()
+        unusual['특이사항']=pd.Series(dtype=str)
+    r1,r2,r3=st.columns(3)
+    r1.metric('RAW 전체 입고금액',f"{scoped_receipts['입고금액'].sum():,.0f}원")
+    r2.metric('특이사항 입고금액',f"{unusual['입고금액'].sum():,.0f}원")
+    r3.metric('특이사항 RAW 행 수',f"{len(unusual):,}건")
+    st.caption('RAW 전체 입고금액은 정상 연결 건을 포함한 선택 날짜의 전체 합계입니다. 아래 표는 매입 완료 건을 제외한 실제 RAW 행만 표시합니다. 미입고(입고행 없음)는 위 발주목록에서 확인하세요.')
+    receipt_cols=['입고일','추정 발주예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','특이사항','매칭상태']
+    st.dataframe(unusual[receipt_cols].sort_values(['입고일','센터명','SKU번호']),hide_index=True,use_container_width=True)
+    st.caption('동일 시각·SKU·수량의 RAW 원본 행도 중복 제거하지 않습니다. 추정 발주예정일은 날짜 구간에 따른 추정값입니다.')
+    st.info('실제 입고일 필터는 RAW 표와 RAW 금액에만 적용됩니다. 발주목록의 입고수량·입고금액·매입상태는 전체 입고 인정 기간으로 계산된 결과이므로 RAW 실제 입고일 필터로 재계산되지 않습니다.')
 
 with t3:
     st.subheader('센터/SKU 매칭 검증')
