@@ -1,4 +1,4 @@
-"""쿠팡 매입 확인 — pip install streamlit pandas openpyxl; streamlit run app_coupang_purchase.py"""
+"""Coupang 매입 확인 — pip install streamlit pandas openpyxl; streamlit run app_coupang_purchase.py"""
 import io
 from collections import defaultdict
 import pandas as pd
