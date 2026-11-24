@@ -104,7 +104,8 @@ selected_raw=dates_between(raw,'입고일',receipt_start,receipt_end)
 if receipt_start>receipt_end:
     st.warning('RAW 데이터의 마지막 실제 입고일이 선택한 입고예정일 시작일보다 빠릅니다. RAW 조회 결과가 비어 있습니다.')
 
-# 발주일과 실제 입고일을 강제로 연결하지 않습니다. 센터+SKU/ME 및 정확한 품목명으로 기간 전체를 대조합니다.
+# 센터별 입고예정일을 기준으로 실제 입고일을 가장 가까운 이전 예정일에 연결합니다.
+# 선택 범위 밖의 다음 예정일도 경계로 사용하여 잘못된 배분을 방지합니다.
 selected_sales['상품명키']=selected_sales.get('제품명',pd.Series('',index=selected_sales.index)).map(norm)
 selected_sales=selected_sales.reset_index(drop=True)
 selected_sales['연결SKU']=selected_sales['ME코드'].map(lambda me:set(products.loc[products['ME코드']==me,'SKU ID']))
@@ -117,10 +118,11 @@ def find(i):
 def union(i,j):
     a,b=find(i),find(j)
     if a!=b:parent[b]=a
-for center,indices in selected_sales.groupby('센터명').groups.items():
+# 같은 센터, 같은 입고예정일, 같은 품목만 하나의 발주 그룹으로 합칩니다.
+for (center,planned_date),indices in selected_sales.groupby(['센터명','예정일']).groups.items():
     indices=list(indices)
-    for p,i in enumerate(indices):
-        for j in indices[p+1:]:
+    for pos,i in enumerate(indices):
+        for j in indices[pos+1:]:
             a,b=selected_sales.loc[i],selected_sales.loc[j]
             if (a['상품명키'] and a['상품명키']==b['상품명키']) or (a['연결SKU'] & b['연결SKU']):
                 union(i,j)
@@ -129,26 +131,33 @@ items=[]
 for gid,g in selected_sales.groupby('그룹',sort=False):
     items.append(dict(센터명=g['센터명'].iloc[0],ME코드=', '.join(sorted(set(g['ME코드']))),
         품목명=' / '.join(dict.fromkeys(g.get('제품명',pd.Series('',index=g.index)).map(clean))),
-        입고예정일=', '.join(sorted(set(g['예정일'].dt.strftime('%Y-%m-%d')))),
+        입고예정일=g['예정일'].iloc[0],
         발주수량=g['발주수량'].sum(),발주금액=g['발주금액'].sum(),
         입고수량=0.,입고금액=0.,SKU집합=set().union(*g['연결SKU'].tolist()),그룹=gid))
 lookup={}
 for item in items:
     for sku in item['SKU집합']:
-        lookup.setdefault((item['센터명'],sku),[]).append(item)
-
-# RAW 행마다 유일한 품목을 찾아 기간 전체에서 집계합니다. 원본 중복행은 삭제하지 않습니다.
+        lookup.setdefault((item['센터명'],item['입고예정일'],sku),[]).append(item)
+# 센터별 전체 Sales Report 날짜를 경계로 사용합니다. (선택 범위 내 날짜만 쓰면
+# 다음 발주일 이후 입고가 이전 발주에 잘못 연결될 수 있습니다.)
+center_dates={c:sorted(set(g['예정일'].dropna())) for c,g in sales.groupby('센터명')}
+from bisect import bisect_right
 receipt_rows=[]
 for _,r in selected_raw.iterrows():
-    row=r.to_dict()
-    candidates=[]
-    if len(r['센터후보'])==1:
+    row=r.to_dict();candidates=[];target_date=pd.NaT
+    if len(r['센터후보'])==1 and pd.notna(r['입고일']):
         center=r['센터후보'][0]
-        candidates=lookup.get((center,r['SKU번호']),[])
-        if not candidates:
-            name=norm(r.get('SKU명',''))
-            if name:
-                candidates=[it for it in items if it['센터명']==center and name in [norm(n) for n in it['품목명'].split(' / ')]]
+        dates=center_dates.get(center,[])
+        idx=bisect_right(dates,r['입고일'])-1
+        if idx>=0:
+            target_date=dates[idx]
+            candidates=lookup.get((center,target_date,r['SKU번호']),[])
+            if not candidates:
+                name=norm(r.get('SKU명',''))
+                if name:
+                    candidates=[it for it in items if it['센터명']==center and it['입고예정일']==target_date
+                                and name in [norm(n) for n in it['품목명'].split(' / ')]]
+    row['연결입고예정일']=target_date
     if len(candidates)==1:
         it=candidates[0]
         it['입고수량']+=r['입고수량'];it['입고금액']+=r['입고금액']
@@ -156,7 +165,8 @@ for _,r in selected_raw.iterrows():
     else:
         row['연결그룹']=None
         row['매칭상태']=('센터 매핑 확인 필요' if len(r['센터후보'])!=1 else
-                       '복수 발주 후보' if len(candidates)>1 else '발주 미연결')
+                       '복수 발주 후보' if len(candidates)>1 else
+                       '연결 입고예정일 없음' if pd.isna(target_date) else '발주 미연결')
     receipt_rows.append(row)
 receipt=pd.DataFrame(receipt_rows)
 records=[]
@@ -164,7 +174,7 @@ for it in items:
     rec={k:v for k,v in it.items() if k!='SKU집합'}
     rec['수량차이']=rec['입고수량']-rec['발주수량']
     rec['금액차이']=rec['입고금액']-rec['발주금액']
-    if rec['입고수량']==0: status='미입고'
+    if rec['입고수량']==0:status='미입고'
     elif rec['입고수량']<rec['발주수량']:status='부분 입고'
     elif rec['입고수량']>rec['발주수량']:status='초과 입고'
     elif abs(rec['금액차이'])>0.5:status='금액 확인 필요'
@@ -177,9 +187,9 @@ if not receipt.empty:
     status_map={r['그룹']:r['매입상태'] for r in records}
     receipt['품목매입상태']=receipt['연결그룹'].map(status_map).fillna('발주 미연결')
 else:
-    receipt=pd.DataFrame(columns=list(selected_raw.columns)+['연결그룹','매칭상태','품목매입상태'])
+    receipt=pd.DataFrame(columns=list(selected_raw.columns)+['연결입고예정일','연결그룹','매칭상태','품목매입상태'])
 
-st.caption(f'입고예정일 {order_start} ~ {order_end} / RAW 실제 입고일 {receipt_start} ~ {receipt_end} (자동) · 입고예정일과 실제 입고일이 달라도 기간 전체로 대조')
+st.caption(f'입고예정일 {order_start} ~ {order_end} / RAW 실제 입고일 {receipt_start} ~ {receipt_end} (자동) · 센터별 가장 가까운 이전 입고예정일로 RAW 연결')
 centers_available=sorted(set(selected_sales['센터명'].dropna()) | set(selected_raw['센터명'].dropna()))
 center=st.selectbox('센터 선택',['전체 센터']+centers_available)
 orders_view=merged if center=='전체 센터' else merged[merged['센터명']==center]
@@ -219,41 +229,29 @@ with t2:
     filtered=raw_view[raw_view['입고일'].dt.date.isin(selected_raw_dates)].copy()
     view_mode=st.radio('RAW 표시 범위',['특이사항만','전체 입고내역'],horizontal=True)
     st.caption(f'선택 날짜 RAW 전체 금액 {raw_view.loc[raw_view["입고일"].dt.date.isin(selected_raw_dates),"입고금액"].sum():,.0f}원')
-    # 먼저 모든 RAW 행을 일자/센터/상품 기준으로 합산한 후 상태를 판단합니다.
-    # 동일 상품이 여러 입고예정일에 반복되는 경우, 날짜별 예정 발주량과 비교합니다.
+    # 표시 목적의 일자별 합산. 판정은 연결된 입고예정일의 전체 RAW 수량으로 수행합니다.
     if not filtered.empty:
         filtered['입고일']=pd.to_datetime(filtered['입고/반출시각'],errors='coerce').dt.normalize()
-        group_cols=['입고일','센터명','SKU명','ME코드']
+        group_cols=['입고일','센터명','SKU명','ME코드','연결입고예정일','연결그룹']
         def unique_join(values):
             return ', '.join(dict.fromkeys(x for x in values.map(clean) if x))
         grouped=filtered.groupby(group_cols,dropna=False,as_index=False).agg(
             센터코드=('센터코드',unique_join),SKU번호=('SKU번호',unique_join),
-            매칭상태=('매칭상태',unique_join),연결그룹=('연결그룹',lambda v: next(iter(set(v.dropna())),None) if len(set(v.dropna()))==1 else None),
+            매칭상태=('매칭상태',unique_join),
             입고수량=('입고수량','sum'),입고금액=('입고금액','sum'),원본행수=('_raw_id','size'))
-        planned=selected_sales.groupby(['그룹','예정일'],dropna=False).agg(발주수량=('발주수량','sum'),발주금액=('발주금액','sum')).to_dict('index')
-        total_status={r['그룹']:r['매입상태'] for r in records}
-        def day_status(r):
-            if pd.isna(r['연결그룹']):return '발주 미연결'
-            target=planned.get((r['연결그룹'],r['입고일']))
-            if target is None:
-                return '입고예정일 대조 필요'
-            qty_delta=r['입고수량']-target['발주수량']
-            amount_delta=r['입고금액']-target['발주금액']
-            if abs(qty_delta)>1e-6:
-                return '부분 입고' if qty_delta<0 else '초과 입고'
-            if abs(amount_delta)>0.5:return '금액 확인 필요'
-            return '매입 완료'
-        grouped['품목매입상태']=grouped.apply(day_status,axis=1)
+        status_map={r['그룹']:r['매입상태'] for r in records}
+        grouped['품목매입상태']=grouped['연결그룹'].map(status_map).fillna('발주 미연결')
         grouped['입고일']=grouped['입고일'].dt.date
-        grouped=grouped[['입고일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭상태','품목매입상태']]
+        grouped['연결입고예정일']=pd.to_datetime(grouped['연결입고예정일']).dt.date
+        grouped=grouped[['입고일','연결입고예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭상태','품목매입상태']]
         grouped=grouped.sort_values(['입고일','센터명','SKU명','ME코드'])
     else:
-        grouped=pd.DataFrame(columns=['입고일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭상태','품목매입상태'])
+        grouped=pd.DataFrame(columns=['입고일','연결입고예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭상태','품목매입상태'])
     if view_mode=='특이사항만':
         grouped=grouped[grouped['품목매입상태']!='매입 완료'].copy()
     st.caption(f'표시 RAW 금액 {grouped["입고금액"].sum():,.0f}원')
     st.dataframe(grouped,hide_index=True,use_container_width=True)
-    st.caption('동일 센터·입고일·SKU명·ME코드의 RAW를 먼저 합산하고, 같은 입고예정일의 발주수량·금액과 비교합니다. 입고예정일과 실제 입고일이 다른 건은 임의로 매입 완료 처리하지 않고 대조 필요로 표시합니다. 기간 전체 매입상태는 ①탭에서 확인하세요.')
+    st.caption('동일 센터·입고일·SKU명·ME코드의 RAW를 합산 표시합니다. 매입상태는 같은 센터의 가장 가까운 이전 입고예정일에 연결된 전체 입고수량·금액으로 판단합니다. RAW 표시일 필터는 매입상태 계산에 영향을 주지 않습니다.')
 with t3:
     st.subheader('발주 미연결 / 센터·SKU 매핑 확인')
     issues=raw_view[raw_view['매칭상태']!='발주 연결'].copy()
@@ -265,6 +263,6 @@ buf=io.BytesIO()
 with pd.ExcelWriter(buf,engine='openpyxl') as writer:
     orders_view.drop(columns=['그룹']).to_excel(writer,sheet_name='기간별 품목 대조',index=False)
     selected_sales[['예정일','센터명','ME코드','제품명','발주수량','발주금액']].to_excel(writer,sheet_name='Sales Report 발주',index=False)
-    receipt[['입고/반출시각','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','매칭상태','품목매입상태']].to_excel(writer,sheet_name='RAW 원본 대조',index=False)
+    receipt[['입고/반출시각','연결입고예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','매칭상태','품목매입상태']].to_excel(writer,sheet_name='RAW 원본 대조',index=False)
     raw_view[raw_view['매칭상태']!='발주 연결'][['입고/반출시각','센터코드','SKU번호','SKU명','입고수량','입고금액','매칭상태']].to_excel(writer,sheet_name='매핑 확인 필요',index=False)
 st.download_button('매입 확인 결과 엑셀 다운로드',data=buf.getvalue(),file_name=f'쿠팡_매입확인_{order_start}_{order_end}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
