@@ -327,7 +327,6 @@ with t2:
     date_options_raw=sorted(raw_view['입고일'].dt.date.dropna().unique())
     selected_raw_dates=st.multiselect('RAW 실제 입고일 필터',date_options_raw,default=date_options_raw)
     filtered=raw_view[raw_view['입고일'].dt.date.isin(selected_raw_dates)].copy()
-    view_mode=st.radio('RAW 표시 범위',['특이사항만','전체 입고내역'],horizontal=True)
     st.caption(f'선택 날짜 RAW 전체 금액 {raw_view.loc[raw_view["입고일"].dt.date.isin(selected_raw_dates),"입고금액"].sum():,.0f}원')
     # 표시 목적의 일자별 합산. 판정은 연결된 입고예정일의 전체 RAW 수량으로 수행합니다.
     if not filtered.empty:
@@ -347,11 +346,17 @@ with t2:
         grouped=grouped.sort_values(['입고일','센터명','SKU명','ME코드'])
     else:
         grouped=pd.DataFrame(columns=['입고일','연결입고예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭방식','매칭상태','품목매입상태'])
-    if view_mode=='특이사항만':
-        grouped=grouped[grouped['품목매입상태']!='매입 완료'].copy()
+    status_options_raw=sorted(grouped['품목매입상태'].dropna().unique().tolist())
+    selected_raw_statuses=st.multiselect(
+        '품목 매입상태 필터',
+        options=status_options_raw,
+        default=status_options_raw,
+        key='raw_item_status_filter',
+    )
+    grouped=grouped[grouped['품목매입상태'].isin(selected_raw_statuses)].copy()
     st.caption(f'표시 RAW 금액 {grouped["입고금액"].sum():,.0f}원')
     st.dataframe(grouped,hide_index=True,use_container_width=True)
-    st.caption('동일 센터·입고일·SKU명·ME코드의 RAW를 합산 표시합니다. 매입상태는 날짜 기준 연결 후 인접 입고예정일 간 수량·금액 일치 여부를 재검토하여 판단합니다. RAW 표시일 필터는 매입상태 계산에 영향을 주지 않습니다.')
+    st.caption('동일 센터·입고일·SKU명·ME코드의 RAW를 합산 표시합니다. 매입상태는 날짜 기준 연결 후 인접 입고예정일 간 수량·금액 일치 여부를 재검토하여 판단합니다. RAW 실제 입고일·품목 매입상태 필터는 표시 행에만 적용되며 매입상태 계산에 영향을 주지 않습니다.')
 with t3:
     st.subheader('발주 미연결 / 센터·SKU 매핑 확인')
     issues=raw_view[raw_view['매칭상태']!='발주 연결'].copy()
