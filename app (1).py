@@ -1,11 +1,11 @@
-"""Coupang 매입 확인 — pip install streamlit pandas openpyxl; streamlit run app_coupang_purchase.py"""
+"""쿠팡 매입 확인 — pip install streamlit pandas openpyxl; streamlit run app_coupang_purchase.py"""
 import io
 from collections import defaultdict
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='Coupang 매입 확인',page_icon='📦',layout='wide')
-st.title('Coupang 매입 확인')
+st.set_page_config(page_title='쿠팡 매입 확인',page_icon='📦',layout='wide')
+st.title('쿠팡 매입 확인')
 st.caption('통합 서식 1개 업로드 · 원본 RAW 모든 행 합산 · 센터 및 SKU 매핑 검증 · 이력 저장 없음')
 
 @st.cache_data(show_spinner=False)
