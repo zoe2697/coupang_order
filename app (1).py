@@ -346,6 +346,19 @@ with t2:
         grouped=grouped.sort_values(['입고일','센터명','SKU명','ME코드'])
     else:
         grouped=pd.DataFrame(columns=['입고일','연결입고예정일','센터명','센터코드','SKU번호','SKU명','ME코드','입고수량','입고금액','원본행수','매칭방식','매칭상태','품목매입상태'])
+    # 미입고 발주에는 RAW 행이 없으므로 화면 표시용 행만 추가합니다.
+    # 실제 입고일 필터와 무관하게 선택 센터·발주기간의 미입고를 표시합니다.
+    missing_orders=orders_view[(orders_view['매입상태']=='미입고') & ~orders_view['그룹'].isin(filtered['연결그룹'].dropna())]
+    if not missing_orders.empty:
+        missing_rows=pd.DataFrame([
+            {'입고일':None,'연결입고예정일':r['입고예정일'].date() if pd.notna(r['입고예정일']) else None,
+             '센터명':r['센터명'],'센터코드':'',
+             'SKU번호':', '.join(sorted(set().union(*(set(products.loc[products['ME코드']==me,'SKU ID']) for me in r['ME코드'].split(', '))))),
+             'SKU명':r['품목명'],'ME코드':r['ME코드'],
+             '입고수량':0,'입고금액':0,'원본행수':0,
+             '매칭방식':'-','매칭상태':'실제 입고 없음','품목매입상태':'미입고'}
+            for _,r in missing_orders.iterrows()],columns=grouped.columns)
+        grouped=pd.concat([grouped,missing_rows],ignore_index=True)
     status_options_raw=sorted(grouped['품목매입상태'].dropna().unique().tolist())
     selected_raw_statuses=st.multiselect(
         '품목 매입상태 필터',
@@ -356,7 +369,7 @@ with t2:
     grouped=grouped[grouped['품목매입상태'].isin(selected_raw_statuses)].copy()
     st.caption(f'표시 RAW 금액 {grouped["입고금액"].sum():,.0f}원')
     st.dataframe(grouped,hide_index=True,use_container_width=True)
-    st.caption('동일 센터·입고일·SKU명·ME코드의 RAW를 합산 표시합니다. 매입상태는 날짜 기준 연결 후 인접 입고예정일 간 수량·금액 일치 여부를 재검토하여 판단합니다. RAW 실제 입고일·품목 매입상태 필터는 표시 행에만 적용되며 매입상태 계산에 영향을 주지 않습니다.')
+    st.caption('동일 센터·입고일·SKU명·ME코드의 RAW를 합산 표시합니다. 매입상태는 날짜 기준 연결 후 인접 입고예정일 간 수량·금액 일치 여부를 재검토하여 판단합니다. RAW 실제 입고일·품목 매입상태 필터는 표시 행에만 적용되며 매입상태 계산에 영향을 주지 않습니다. 미입고 품목은 실제 입고일이 없으므로 RAW 날짜 필터와 무관하게 선택 센터 및 발주기간 기준으로 표시합니다.')
 with t3:
     st.subheader('발주 미연결 / 센터·SKU 매핑 확인')
     issues=raw_view[raw_view['매칭상태']!='발주 연결'].copy()
